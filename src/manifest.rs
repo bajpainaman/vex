@@ -10,12 +10,13 @@
 //
 //===----------------------------------------------------------------------===//
 use std::collections::BTreeMap;
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+
+use crate::version::Version;
 
 pub const MANIFEST_FILE_NAME: &str = "vex.toml";
 
@@ -26,49 +27,6 @@ const DEFAULT_MAIN_FILE: &str = "main.vx";
 /// one of these names could never be imported.
 const RESERVED_PACKAGE_NAMES: [&str; 2] = ["std", "core"];
 
-/// A version is written `MAJOR.MINOR.PATCH`.
-const VERSION_PART_COUNT: usize = 3;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Version {
-    pub major: u64,
-    pub minor: u64,
-    pub patch: u64,
-}
-
-impl Version {
-    /// Read a version written as `MAJOR.MINOR.PATCH`.
-    ///
-    /// # Errors
-    ///
-    /// If `text` is not three numbers with dots between them.
-    fn parse(text: &str) -> Result<Self> {
-        let parts: Vec<&str> = text.split('.').collect();
-        if parts.len() != VERSION_PART_COUNT {
-            bail!("version `{text}` must be three numbers, like `1.2.3`");
-        }
-        let number = |part: &str| -> Result<u64> {
-            // `u64::from_str` accepts a leading `+`, which is not part of a version.
-            if part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()) {
-                bail!("version `{text}` must be three numbers, like `1.2.3`");
-            }
-            part.parse::<u64>()
-                .with_context(|| format!("version `{text}` has a number that is too large"))
-        };
-        Ok(Self {
-            major: number(parts[0])?,
-            minor: number(parts[1])?,
-            patch: number(parts[2])?,
-        })
-    }
-}
-
-impl fmt::Display for Version {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
-    }
-}
-
 /// A checked `vex.toml`. Every path in it is absolute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -78,8 +36,20 @@ pub struct Manifest {
     pub dir: PathBuf,
     /// The file with `fn main`. A package without one is a library.
     pub main: Option<PathBuf>,
-    /// The directory of each package this one depends on, by package name.
-    pub dependencies: BTreeMap<String, PathBuf>,
+    /// A sentence about the package, shown by `vex search`.
+    pub description: Option<String>,
+    /// Each package this one depends on, by package name.
+    pub dependencies: BTreeMap<String, Dependency>,
+}
+
+/// Where a dependency comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dependency {
+    /// `name = { path = ".." }`: a package in a local directory, which is absolute here.
+    Path(PathBuf),
+    /// `name = "1.2.0"`: version 1.2.0 or a later compatible one from the registry. The build
+    /// takes the lowest version that every package asking for `name` accepts.
+    Registry(Version),
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +66,7 @@ struct RawPackage {
     name: String,
     version: String,
     main: Option<PathBuf>,
+    description: Option<String>,
 }
 
 impl Manifest {
@@ -147,7 +118,7 @@ impl Manifest {
             if *name == raw.package.name {
                 bail!("package `{name}` lists itself as a dependency");
             }
-            dependencies.insert(name.clone(), dependency_dir(name, value, dir)?);
+            dependencies.insert(name.clone(), dependency(name, value, dir)?);
         }
 
         Ok(Self {
@@ -155,6 +126,7 @@ impl Manifest {
             version,
             dir: dir.to_path_buf(),
             main,
+            description: raw.package.description,
             dependencies,
         })
     }
@@ -165,7 +137,7 @@ impl Manifest {
 /// # Errors
 ///
 /// If `name` is not an identifier, or is a standard library name.
-fn check_package_name(name: &str) -> Result<()> {
+pub fn check_package_name(name: &str) -> Result<()> {
     let starts_like_an_identifier = name
         .chars()
         .next()
@@ -181,29 +153,35 @@ fn check_package_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The directory a `[dependencies]` entry points at. Only `{ path = ".." }` exists so far.
+/// What a `[dependencies]` entry asks for: `"1.2.0"` or `{ path = ".." }`.
 ///
 /// # Errors
 ///
-/// If the entry is not `{ path = ".." }`, or the directory does not exist.
-fn dependency_dir(name: &str, value: &toml::Value, package_dir: &Path) -> Result<PathBuf> {
+/// If the entry is neither, the version is not valid, or the directory does not exist.
+fn dependency(name: &str, value: &toml::Value, package_dir: &Path) -> Result<Dependency> {
     let path = match value {
-        toml::Value::String(version) => bail!(
-            "dependency `{name} = \"{version}\"` asks for a version from a registry, which vex does \
-             not have yet; write `{name} = {{ path = \"..\" }}`"
-        ),
+        toml::Value::String(version) => {
+            let version = Version::parse(version).with_context(|| {
+                format!("dependency `{name}` must name the lowest version it works with")
+            })?;
+            return Ok(Dependency::Registry(version));
+        }
         toml::Value::Table(table) => match (table.len(), table.get("path")) {
             (1, Some(toml::Value::String(path))) => path,
             _ => bail!(
-                "dependency `{name}` must be written `{name} = {{ path = \"..\" }}`; no other kind \
-                 of dependency exists yet"
+                "dependency `{name}` must be written `{name} = \"1.2.0\"` or \
+                 `{name} = {{ path = \"..\" }}`"
             ),
         },
-        _ => bail!("dependency `{name}` must be written `{name} = {{ path = \"..\" }}`"),
+        _ => bail!(
+            "dependency `{name}` must be written `{name} = \"1.2.0\"` or `{name} = {{ path = \"..\" }}`"
+        ),
     };
     let dir = package_dir.join(path);
-    dir.canonicalize()
-        .with_context(|| format!("dependency `{name}`: `{}` does not exist", dir.display()))
+    let dir = dir
+        .canonicalize()
+        .with_context(|| format!("dependency `{name}`: `{}` does not exist", dir.display()))?;
+    Ok(Dependency::Path(dir))
 }
 
 #[cfg(test)]
@@ -278,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_must_be_three_numbers() {
+    fn a_package_version_must_be_three_numbers() {
         for version in ["1.2", "1.2.3.4", "1.x.3", "1..3", "+1.2.3", ""] {
             let error = error_of(&format!(
                 "[package]\nname = \"app\"\nversion = \"{version}\"\n"
@@ -333,7 +311,9 @@ mod tests {
         .expect("a vex.toml with one dependency");
         assert_eq!(
             manifest.dependencies.get("geometry"),
-            Some(&geometry.canonicalize().expect("resolve geometry"))
+            Some(&Dependency::Path(
+                geometry.canonicalize().expect("resolve geometry")
+            ))
         );
     }
 
@@ -347,11 +327,31 @@ mod tests {
     }
 
     #[test]
-    fn a_version_dependency_is_refused_until_there_is_a_registry() {
-        let error = error_of(
-            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n\n[dependencies]\ngeometry = \"1.0.0\"\n",
+    fn a_version_dependency_comes_from_the_registry() {
+        let manifest = parse_in_empty_dir(
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n\n[dependencies]\ngeometry = \"1.4.0\"\n",
+        )
+        .expect("a vex.toml with one registry dependency");
+        assert_eq!(
+            manifest.dependencies.get("geometry"),
+            Some(&Dependency::Registry(Version {
+                major: 1,
+                minor: 4,
+                patch: 0
+            }))
         );
-        assert!(error.contains("does not have yet"), "{error}");
+    }
+
+    #[test]
+    fn a_version_dependency_must_be_a_full_version() {
+        let error = error_of(
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n\n[dependencies]\ngeometry = \"^1.4\"\n",
+        );
+        assert!(
+            error.contains("dependency `geometry` must name the lowest version it works with"),
+            "{error}"
+        );
+        assert!(error.contains("must be three numbers"), "{error}");
     }
 
     #[test]
@@ -360,7 +360,7 @@ mod tests {
             "[package]\nname = \"app\"\nversion = \"1.0.0\"\n\n[dependencies]\ngeometry = { path = \".\", rev = \"abc\" }\n",
         );
         assert!(
-            error.contains("no other kind of dependency exists yet"),
+            error.contains("must be written `geometry = \"1.2.0\"` or"),
             "{error}"
         );
     }

@@ -10,12 +10,15 @@
 // another package.
 //
 //===----------------------------------------------------------------------===//
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 
-use crate::manifest::{Manifest, MANIFEST_FILE_NAME};
+use crate::cache::Cache;
+use crate::manifest::{Dependency, Manifest, MANIFEST_FILE_NAME};
+use crate::registry::{Registry, Release, REGISTRY_ENV_VAR};
+use crate::resolve::{select_versions, Requirement};
 
 /// A package and everything it needs to compile.
 #[derive(Debug)]
@@ -26,22 +29,121 @@ pub struct PackageGraph {
     /// One name maps to one directory because the compiler's `--package name=dir` does, so a build
     /// holds one copy of each package.
     pub packages: BTreeMap<String, PathBuf>,
+    /// The registry packages in the build, by name. These go into `vex.lock`.
+    pub releases: BTreeMap<String, Release>,
 }
 
 impl PackageGraph {
-    /// Find every package `root` needs.
+    /// Find every package `root` needs. `registry` is needed only when some package in the build
+    /// asks for a version from a registry.
     ///
     /// # Errors
     ///
-    /// If a dependency's `vex.toml` cannot be read, two packages share a name, or packages
-    /// depend on each other in a circle.
-    pub fn resolve(root: Manifest) -> Result<Self> {
+    /// If a dependency's `vex.toml` cannot be read, two packages share a name, packages depend on
+    /// each other in a circle, or a registry package cannot be found or fetched.
+    pub fn resolve(root: Manifest, registry: Option<&mut Registry>, cache: &Cache) -> Result<Self> {
+        let requirements = registry_requirements(&root)?;
+        let mut releases = BTreeMap::new();
+        let mut registry_dirs = BTreeMap::new();
+        if !requirements.is_empty() {
+            let Some(registry) = registry else {
+                let first = &requirements[0];
+                bail!(
+                    "`{}` asks for `{}` {} from a registry, but no registry is set. Pass \
+                     --registry, or set {REGISTRY_ENV_VAR}",
+                    first.wanted_by,
+                    first.name,
+                    first.minimum
+                );
+            };
+            releases = select_versions(&requirements, registry)?;
+            for release in releases.values() {
+                let dir = cache.unpacked(release, registry)?;
+                check_matches_index(&dir, release)?;
+                registry_dirs.insert(release.name.clone(), dir);
+            }
+        }
+
         let mut packages = BTreeMap::new();
         packages.insert(root.name.clone(), root.dir.clone());
         let mut chain = vec![root.name.clone()];
-        visit(&root, &mut chain, &mut packages)?;
-        Ok(Self { root, packages })
+        visit(&root, &registry_dirs, &mut chain, &mut packages)?;
+        Ok(Self {
+            root,
+            packages,
+            releases,
+        })
     }
+}
+
+/// The registry versions asked for by `root` and by every local package it reaches through
+/// `{ path = ".." }` dependencies. Registry packages are not followed: their own needs come from
+/// the registry's index.
+///
+/// # Errors
+///
+/// If a local dependency's `vex.toml` cannot be read.
+fn registry_requirements(root: &Manifest) -> Result<Vec<Requirement>> {
+    let mut requirements = Vec::new();
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut work = vec![root.clone()];
+    seen.insert(root.dir.clone());
+    while let Some(manifest) = work.pop() {
+        for (name, dependency) in &manifest.dependencies {
+            match dependency {
+                Dependency::Registry(minimum) => requirements.push(Requirement {
+                    name: name.clone(),
+                    minimum: *minimum,
+                    wanted_by: manifest.name.clone(),
+                }),
+                Dependency::Path(dir) => {
+                    if seen.insert(dir.clone()) {
+                        work.push(Manifest::load(&dir.join(MANIFEST_FILE_NAME)).with_context(
+                            || format!("while reading dependency `{name}` of `{}`", manifest.name),
+                        )?);
+                    }
+                }
+            }
+        }
+    }
+    Ok(requirements)
+}
+
+/// A registry package's own `vex.toml` must say what its index line says, because the index is
+/// what versions were picked from.
+///
+/// # Errors
+///
+/// If the two disagree, or the `vex.toml` cannot be read.
+fn check_matches_index(dir: &std::path::Path, release: &Release) -> Result<()> {
+    let manifest = Manifest::load(&dir.join(MANIFEST_FILE_NAME)).with_context(|| {
+        format!(
+            "in the registry package `{}` {}",
+            release.name, release.version
+        )
+    })?;
+    let dependencies: Option<BTreeMap<String, crate::version::Version>> = manifest
+        .dependencies
+        .iter()
+        .map(|(name, dependency)| match dependency {
+            Dependency::Registry(minimum) => Some((name.clone(), *minimum)),
+            Dependency::Path(_) => None,
+        })
+        .collect();
+    if manifest.name != release.name
+        || manifest.version != release.version
+        || dependencies.as_ref() != Some(&release.dependencies)
+    {
+        bail!(
+            "the registry package `{}` {} does not match its index entry: its vex.toml names \
+             `{}` {} and different dependencies. The registry is damaged",
+            release.name,
+            release.version,
+            manifest.name,
+            manifest.version
+        );
+    }
+    Ok(())
 }
 
 /// `chain` is the list of packages from the root down to `manifest`, used to report a cycle.
@@ -51,10 +153,21 @@ impl PackageGraph {
 /// The same as [`PackageGraph::resolve`].
 fn visit(
     manifest: &Manifest,
+    registry_dirs: &BTreeMap<String, PathBuf>,
     chain: &mut Vec<String>,
     packages: &mut BTreeMap<String, PathBuf>,
 ) -> Result<()> {
-    for (name, dir) in &manifest.dependencies {
+    for (name, dependency) in &manifest.dependencies {
+        let dir = match dependency {
+            Dependency::Path(dir) => dir,
+            // Every registry dependency was picked in `resolve`, or its index check failed.
+            Dependency::Registry(_) => registry_dirs.get(name).with_context(|| {
+                format!(
+                    "internal error: no version of `{name}` was picked for `{}`",
+                    manifest.name
+                )
+            })?,
+        };
         if let Some(known_dir) = packages.get(name) {
             if known_dir != dir {
                 bail!(
@@ -88,7 +201,7 @@ fn visit(
 
         packages.insert(name.clone(), dir.clone());
         chain.push(name.clone());
-        visit(&dependency, chain, packages)?;
+        visit(&dependency, registry_dirs, chain, packages)?;
         chain.pop();
     }
     Ok(())
@@ -127,9 +240,11 @@ mod tests {
     }
 
     fn resolve_package(root: &Path, dir_name: &str) -> Result<PackageGraph> {
-        PackageGraph::resolve(Manifest::load(
-            &root.join(dir_name).join(MANIFEST_FILE_NAME),
-        )?)
+        PackageGraph::resolve(
+            Manifest::load(&root.join(dir_name).join(MANIFEST_FILE_NAME))?,
+            None,
+            &Cache::new(root.join("cache")),
+        )
     }
 
     fn error_of(root: &Path, dir_name: &str) -> String {
