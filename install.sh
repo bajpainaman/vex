@@ -24,9 +24,15 @@ esac
 
 version="${VEX_VERSION:-}"
 if [ -z "$version" ]; then
-    version=$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" |
-        sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
-    [ -n "$version" ] || fail "cannot find the latest release of $repo"
+    # github.com redirects releases/latest to the latest tag. The GitHub API would say the same,
+    # but it allows only 60 requests an hour per address, which a shared network uses up.
+    latest=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$repo/releases/latest") ||
+        fail "cannot reach https://github.com/$repo/releases/latest"
+    version=${latest##*/tag/}
+    case "$version" in
+        v[0-9]*) ;;
+        *) fail "cannot find the latest release of $repo (github.com sent $latest)" ;;
+    esac
 fi
 
 name="vex-$version-$build"
