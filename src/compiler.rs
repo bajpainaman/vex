@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
@@ -23,7 +23,10 @@ const COMPILER_NAME: &str = "vxc";
 const COMPILER_ENV_VAR: &str = "VXC";
 
 /// Where `vex build` writes, inside the package directory.
-const OUTPUT_DIR_NAME: &str = "target";
+pub const OUTPUT_DIR_NAME: &str = "target";
+
+/// Where `vex package` writes archives, inside the output directory.
+const PACKAGE_DIR_NAME: &str = "package";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -57,6 +60,11 @@ pub fn locate_compiler() -> PathBuf {
 /// The object file `vex build` writes for this package.
 pub fn output_path(graph: &PackageGraph) -> PathBuf {
     output_dir(graph).join(format!("{}.o", graph.root.name))
+}
+
+/// The directory `vex package` writes archives into.
+pub fn package_output_dir(package_dir: &Path) -> PathBuf {
+    package_dir.join(OUTPUT_DIR_NAME).join(PACKAGE_DIR_NAME)
 }
 
 /// The directory `vex build` writes into.
@@ -126,7 +134,8 @@ pub fn compiler_args(
 )]
 mod tests {
     use super::*;
-    use crate::manifest::{Manifest, Version};
+    use crate::manifest::{Dependency, Manifest};
+    use crate::version::Version;
     use std::collections::BTreeMap;
 
     fn graph_of_app_and_shapes(main: Option<&str>) -> PackageGraph {
@@ -139,13 +148,21 @@ mod tests {
             },
             dir: PathBuf::from("/work/app"),
             main: main.map(PathBuf::from),
-            dependencies: BTreeMap::from([("shapes".to_string(), PathBuf::from("/work/shapes"))]),
+            description: None,
+            dependencies: BTreeMap::from([(
+                "shapes".to_string(),
+                Dependency::Path(PathBuf::from("/work/shapes")),
+            )]),
         };
         let packages = BTreeMap::from([
             ("app".to_string(), PathBuf::from("/work/app")),
             ("shapes".to_string(), PathBuf::from("/work/shapes")),
         ]);
-        PackageGraph { root, packages }
+        PackageGraph {
+            root,
+            packages,
+            releases: BTreeMap::new(),
+        }
     }
 
     fn args_as_text(graph: &PackageGraph, action: Action, options: &CompileOptions) -> Vec<String> {
