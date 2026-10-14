@@ -1,0 +1,9 @@
+// Fails on purpose, so the tests of `vex test` can see a failure reported.
+import zip::crc;
+
+fn main() -> i32 {
+  if crc_of_digits() != 1u64 {
+    return 3;
+  }
+  return 0;
+}

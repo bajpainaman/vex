@@ -18,8 +18,10 @@ mod compiler;
 mod graph;
 mod lock;
 mod manifest;
+mod new_package;
 mod registry;
 mod resolve;
+mod test_runner;
 mod version;
 
 use std::env;
@@ -31,7 +33,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use cache::Cache;
-use compiler::{Action, CompileOptions};
+use compiler::{Action, CompileOptions, Compiled, CompilerFeatures};
 use graph::PackageGraph;
 use lock::LockMode;
 use manifest::{Dependency, Manifest, MANIFEST_FILE_NAME};
@@ -60,8 +62,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CliCommand {
-    /// Compile the package to an object file in its `target` directory
-    Build(CompileFlags),
+    /// Compile the package to a program in its `target` directory
+    Build {
+        #[command(flatten)]
+        flags: CompileFlags,
+
+        /// Write an object file, `target/<name>.o`, instead of a program
+        #[arg(long = "object")]
+        object: bool,
+    },
     /// Compile the package and run it. The exit code is the program's own
     Run {
         #[command(flatten)]
@@ -70,6 +79,14 @@ enum CliCommand {
         /// Arguments for the program, after `--`
         #[arg(last = true)]
         program_args: Vec<String>,
+    },
+    /// Run every program in the package's `tests` directory. A test passes when it exits with 0
+    Test {
+        #[command(flatten)]
+        flags: CompileFlags,
+
+        /// Run only the tests whose file name contains this text
+        filter: Option<String>,
     },
     /// Download the registry packages the build needs and write vex.lock, without compiling
     Fetch,
@@ -84,6 +101,15 @@ enum CliCommand {
     Package,
     /// Put this version of the package into a registry in a directory
     Publish,
+    /// Create a new package in a new directory
+    New {
+        /// The directory to create. Its name is the package's name
+        path: PathBuf,
+
+        /// Make a library, with no `main.vx`
+        #[arg(long = "lib")]
+        lib: bool,
+    },
 }
 
 #[derive(Args)]
@@ -95,6 +121,18 @@ struct CompileFlags {
     /// The host the program runs on, as `vxc --host` takes it: a file, or `default`
     #[arg(long = "host", value_name = "FILE|default")]
     host: Option<String>,
+}
+
+impl CompileFlags {
+    fn into_options(self, program_args: Vec<String>) -> CompileOptions {
+        CompileOptions {
+            machine: self.machine,
+            host: self.host,
+            program_args,
+            entry: None,
+            output: None,
+        }
+    }
 }
 
 fn main() {
@@ -113,6 +151,10 @@ fn main() {
 ///
 /// If the package or one of its dependencies is not usable, or the compiler cannot be run.
 fn run(cli: Cli) -> Result<i32> {
+    if let CliCommand::New { path, lib } = &cli.command {
+        new_package::create(path, *lib)?;
+        return Ok(0);
+    }
     let manifest_path = match cli.manifest_path {
         Some(path) => path,
         None => find_manifest()?,
@@ -125,26 +167,36 @@ fn run(cli: Cli) -> Result<i32> {
         LockMode::Update
     };
 
+    let compiler_path = compiler::locate_compiler();
     let (action, options) = match cli.command {
-        CliCommand::Build(flags) => (
-            Action::Build,
-            CompileOptions {
-                machine: flags.machine,
-                host: flags.host,
-                program_args: Vec::new(),
-            },
-        ),
+        CliCommand::Build { flags, object } => {
+            let action = if object {
+                Action::BuildObject
+            } else if CompilerFeatures::of(&compiler_path).executables {
+                Action::BuildExecutable
+            } else {
+                eprintln!(
+                    "note: this vxc cannot build a program that runs by itself, so vex writes an \
+                     object file instead"
+                );
+                Action::BuildObject
+            };
+            (action, flags.into_options(Vec::new()))
+        }
         CliCommand::Run {
             flags,
             program_args,
-        } => (
-            Action::Run,
-            CompileOptions {
-                machine: flags.machine,
-                host: flags.host,
-                program_args,
-            },
-        ),
+        } => (Action::Run, flags.into_options(program_args)),
+        CliCommand::Test { flags, filter } => {
+            let graph = resolve_and_lock(manifest, registry.as_mut(), lock_mode)?;
+            return test_runner::run_tests(
+                &graph,
+                &flags.into_options(Vec::new()),
+                filter.as_deref(),
+                &compiler_path,
+            );
+        }
+        CliCommand::New { .. } => unreachable!("`vex new` returned above"),
         CliCommand::Fetch => {
             let graph = resolve_and_lock(manifest, registry.as_mut(), lock_mode)?;
             for release in graph.releases.values() {
@@ -163,46 +215,73 @@ fn run(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         CliCommand::Publish => {
-            let Some(registry) = registry.as_mut() else {
-                bail!(
-                    "vex publish needs a registry. Pass --registry DIR, or set {REGISTRY_ENV_VAR}"
-                );
-            };
-            let (path, release) = package(&manifest, Some(registry))?;
-            let archive =
-                fs::read(&path).with_context(|| format!("cannot read `{}`", path.display()))?;
-            registry.publish(&release, &archive)?;
-            println!(
-                "published {} {} to {}",
-                release.name,
-                release.version,
-                registry.describe()
-            );
+            publish(&manifest, registry.as_mut())?;
             return Ok(0);
         }
     };
 
     let graph = resolve_and_lock(manifest, registry.as_mut(), lock_mode)?;
-    let args = compiler::compiler_args(&graph, action, &options)?;
-    if action == Action::Build {
-        let output_dir = compiler::output_dir(&graph);
-        fs::create_dir_all(&output_dir)
-            .with_context(|| format!("cannot create `{}`", output_dir.display()))?;
+    build_or_run(&graph, action, &options, &compiler_path)
+}
+
+/// Compile the root package of `graph`, and for `vex run` run it too. Returns the exit code for
+/// `vex`: the compiler's if it fails, else the program's.
+///
+/// # Errors
+///
+/// If the compiler or the program cannot be started.
+fn build_or_run(
+    graph: &PackageGraph,
+    action: Action,
+    options: &CompileOptions,
+    compiler_path: &Path,
+) -> Result<i32> {
+    let features = CompilerFeatures::of(compiler_path);
+    if action == Action::Run && !features.executables {
+        // This vxc can only run a program inside itself, which hides the program's exit code.
+        let args = compiler::compiler_args(graph, action, options, features)?;
+        let status = Command::new(compiler_path)
+            .args(&args)
+            .status()
+            .with_context(|| {
+                format!(
+                    "cannot run the compiler `{}`. Install Vx, or set VXC to the path of `vxc`",
+                    compiler_path.display()
+                )
+            })?;
+        let Some(code) = status.code() else {
+            bail!("the compiler was stopped by a signal: {status}");
+        };
+        return Ok(code);
     }
 
-    let compiler_path = compiler::locate_compiler();
-    let status = Command::new(&compiler_path)
-        .args(&args)
+    // `vex run` builds the program first, so the program gets its own arguments and its own exit
+    // code reaches the caller.
+    let build_action = if action == Action::Run {
+        Action::BuildExecutable
+    } else {
+        action
+    };
+    let args = compiler::compiler_args(graph, build_action, options, features)?;
+    let output_dir = compiler::output_dir(graph);
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("cannot create `{}`", output_dir.display()))?;
+    if let Compiled::Failed { exit_code, printed } = compiler::compile(compiler_path, &args)? {
+        eprint!("{printed}");
+        return Ok(exit_code);
+    }
+    let program = compiler::output_path(graph, build_action);
+    if action != Action::Run {
+        println!("built {}", program.display());
+        return Ok(0);
+    }
+    let status = Command::new(&program)
+        .args(&options.program_args)
         .status()
-        .with_context(|| {
-            format!(
-                "cannot run the compiler `{}`. Install Vx, or set VXC to the path of `vxc`",
-                compiler_path.display()
-            )
-        })?;
+        .with_context(|| format!("cannot run `{}`", program.display()))?;
     match status.code() {
         Some(code) => Ok(code),
-        None => bail!("the compiler was stopped by a signal: {status}"),
+        None => bail!("`{}` was stopped by a signal: {status}", program.display()),
     }
 }
 
@@ -233,6 +312,27 @@ fn resolve_and_lock(
     let graph = PackageGraph::resolve(manifest, registry, &Cache::from_env()?)?;
     lock::check_and_update(&graph.root.dir, &graph.releases, lock_mode)?;
     Ok(graph)
+}
+
+/// Pack the package and add it to the registry.
+///
+/// # Errors
+///
+/// If there is no registry, [`package`] refuses the package, or the registry refuses the version.
+fn publish(manifest: &Manifest, registry: Option<&mut Registry>) -> Result<()> {
+    let Some(registry) = registry else {
+        bail!("vex publish needs a registry. Pass --registry DIR, or set {REGISTRY_ENV_VAR}");
+    };
+    let (path, release) = package(manifest, Some(registry))?;
+    let archive = fs::read(&path).with_context(|| format!("cannot read `{}`", path.display()))?;
+    registry.publish(&release, &archive)?;
+    println!(
+        "published {} {} to {}",
+        release.name,
+        release.version,
+        registry.describe()
+    );
+    Ok(())
 }
 
 /// Write the package's archive to `target/package` and return its path and index entry.
@@ -277,6 +377,12 @@ fn package(manifest: &Manifest, registry: Option<&mut Registry>) -> Result<(Path
             .with_context(|| format!("the dependencies of `{}` do not resolve", manifest.name))?;
     }
 
+    ensure!(
+        manifest.link.dirs.is_empty(),
+        "`{}` names `dirs` under `[link]`. Those directories exist only on this computer, so a \
+         published package can name C libraries only from the system's usual places",
+        manifest.name
+    );
     let archive = archive::pack(&manifest.dir)?;
     let output_dir = compiler::package_output_dir(&manifest.dir);
     fs::create_dir_all(&output_dir)

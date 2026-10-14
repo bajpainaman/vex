@@ -27,16 +27,33 @@ numbers = "1.2.0"                # version 1.2.0 or later of `numbers`, from a r
 package with a `main.vx` is a program; one without is a library. `description = ".."` under
 `[package]` is optional and goes into the registry.
 
+A package that calls a C library through an `extern` block names it, and every program that
+uses the package links it:
+
+```toml
+[link]
+libraries = ["z"]   # links zlib, as `-l z` does
+dirs = ["native"]   # optional: where to look besides the system's usual places
+```
+
 ## Commands
 
 ```sh
-vex run              # compile the package and run it; the exit code is the program's
-vex build            # compile to target/<name>.o
+vex new hello        # a new program in hello/, with a test; `--lib` for a library
+vex run              # build the program and run it; the exit code is the program's
 vex run -- --steps 3 # arguments after -- go to the program
+vex build            # build the program, target/<name>
+vex build --object   # write an object file, target/<name>.o, instead
+vex test             # run each program in tests/; a test passes when it exits with 0
+vex test parse       # run only the tests whose file name contains `parse`
 ```
 
-Both take `--machine FILE` and `--host FILE|default`, which go to `vxc` unchanged, and
-`--manifest-path FILE` to name a `vex.toml` that is not in this directory or above it.
+A test is a program with its own `fn main` in `tests/`, and it can `import` the package it tests
+by the package's name. Vx has no test attribute yet, so this needs nothing from the language.
+
+`run`, `build` and `test` take `--machine FILE` and `--host FILE|default`, which go to `vxc`
+unchanged. Every command takes `--manifest-path FILE` to name a `vex.toml` that is not in this
+directory or above it.
 
 Registry commands:
 
@@ -54,6 +71,10 @@ instead of changing `vex.lock`, as a CI build should. Downloads are kept in `$VE
 
 `vex` finds the compiler through `$VXC`, then a `vxc` beside itself, then `PATH`. It needs the
 `--package` flag, which a `vxc` built from Vx's `main` has; the v0.0.3 release does not.
+Building a program needs `vxc -a emit-exe`, and `[link]` needs `vxc -l`; `vex` asks the
+compiler (`vxc --help`) whether it has them. Without `emit-exe`, `vex build` writes an object
+file, and `vex run` and `vex test` run the program inside `vxc`, which exits with 1 whatever
+the program returned.
 
 ## The registry
 
@@ -95,8 +116,8 @@ What protects a build:
 
 ## Not done
 
-Git dependencies, yanking a bad version, authentication for publishing to a shared registry,
-and linking a C library a package wraps. A package can also import another it does not list, because `vxc` must see every package
+Git dependencies, yanking a bad version, and authentication for publishing to a shared
+registry. A package can also import another it does not list, because `vxc` must see every package
 in the build.
 
 ## Building and testing
@@ -104,7 +125,7 @@ in the build.
 ```sh
 cargo build
 cargo test                       # unit tests; the end-to-end tests skip without VXC
-VXC=/path/to/vxc cargo test      # also runs three packages through a real compiler
+VXC=/path/to/vxc cargo test      # also compiles and runs the packages in tests/packages
 ```
 
 A `vxc` built from source needs the LLVM tools on `PATH` (Vx's `config.local` sets that); the

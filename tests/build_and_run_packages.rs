@@ -99,7 +99,11 @@ fn build_writes_an_object_file_in_the_package() {
     let packages = tempfile::tempdir().expect("create a temporary directory");
     copy_packages_to(packages.path());
 
-    let output = vex(&["build"], &packages.path().join("app/vex.toml"), &compiler);
+    let output = vex(
+        &["build", "--object"],
+        &packages.path().join("app/vex.toml"),
+        &compiler,
+    );
     assert_eq!(output.status.code(), Some(0), "{}", printed(&output));
     let object_file = packages.path().join("app/target/app.o");
     let size = fs::metadata(&object_file)

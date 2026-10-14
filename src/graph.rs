@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
 use crate::cache::Cache;
-use crate::manifest::{Dependency, Manifest, MANIFEST_FILE_NAME};
+use crate::manifest::{Dependency, Link, Manifest, MANIFEST_FILE_NAME};
 use crate::registry::{Registry, Release, REGISTRY_ENV_VAR};
 use crate::resolve::{select_versions, Requirement};
 
@@ -31,6 +31,8 @@ pub struct PackageGraph {
     pub packages: BTreeMap<String, PathBuf>,
     /// The registry packages in the build, by name. These go into `vex.lock`.
     pub releases: BTreeMap<String, Release>,
+    /// The C libraries of every package in the build, each listed once.
+    pub link: Link,
 }
 
 impl PackageGraph {
@@ -67,11 +69,14 @@ impl PackageGraph {
         let mut packages = BTreeMap::new();
         packages.insert(root.name.clone(), root.dir.clone());
         let mut chain = vec![root.name.clone()];
-        visit(&root, &registry_dirs, &mut chain, &mut packages)?;
+        let mut link = Link::default();
+        add_link(&mut link, &root.link);
+        visit(&root, &registry_dirs, &mut chain, &mut packages, &mut link)?;
         Ok(Self {
             root,
             packages,
             releases,
+            link,
         })
     }
 }
@@ -156,6 +161,7 @@ fn visit(
     registry_dirs: &BTreeMap<String, PathBuf>,
     chain: &mut Vec<String>,
     packages: &mut BTreeMap<String, PathBuf>,
+    link: &mut Link,
 ) -> Result<()> {
     for (name, dependency) in &manifest.dependencies {
         let dir = match dependency {
@@ -200,11 +206,27 @@ fn visit(
         }
 
         packages.insert(name.clone(), dir.clone());
+        add_link(link, &dependency.link);
         chain.push(name.clone());
-        visit(&dependency, registry_dirs, chain, packages)?;
+        visit(&dependency, registry_dirs, chain, packages, link)?;
         chain.pop();
     }
     Ok(())
+}
+
+/// Add the libraries and directories of `package` that `all` does not have yet, keeping their
+/// order: a C linker can care which library comes first.
+fn add_link(all: &mut Link, package: &Link) {
+    for library in &package.libraries {
+        if !all.libraries.contains(library) {
+            all.libraries.push(library.clone());
+        }
+    }
+    for dir in &package.dirs {
+        if !all.dirs.contains(dir) {
+            all.dirs.push(dir.clone());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -271,6 +293,26 @@ mod tests {
                 .canonicalize()
                 .expect("resolve numbers")
         );
+    }
+
+    #[test]
+    fn the_c_libraries_of_every_package_are_linked_once() {
+        let root = tempfile::tempdir().expect("create a temporary directory");
+        write_package(root.path(), "app", "app", &[("zip", "zip"), ("png", "png")]);
+        for (name, libraries) in [("zip", "\"z\""), ("png", "\"png\", \"z\"")] {
+            fs::create_dir_all(root.path().join(name)).expect("create a package directory");
+            fs::write(
+                root.path().join(name).join(MANIFEST_FILE_NAME),
+                format!(
+                    "[package]\nname = \"{name}\"\nversion = \"1.0.0\"\n\n[link]\nlibraries = [{libraries}]\n"
+                ),
+            )
+            .expect("write vex.toml");
+        }
+
+        let graph = resolve_package(root.path(), "app").expect("two packages that link C");
+        // `png` comes first because `[dependencies]` is read in name order.
+        assert_eq!(graph.link.libraries, ["png", "z"]);
     }
 
     #[test]

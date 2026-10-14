@@ -1,0 +1,6 @@
+[package]
+name = "checksum"
+version = "1.0.0"
+
+[dependencies]
+zip = { path = "../zip" }

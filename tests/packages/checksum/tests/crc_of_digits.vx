@@ -1,0 +1,9 @@
+// Passes: 3421780262 is the crc32 of "123456789", the check value zlib's own tests use.
+import zip::crc;
+
+fn main() -> i32 {
+  if crc_of_digits() != 3421780262u64 {
+    return 1;
+  }
+  return 0;
+}
