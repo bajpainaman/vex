@@ -10,6 +10,17 @@ This is a prototype, written as a data point for
 [vx-lang/Vx#1275](https://github.com/vx-lang/Vx/issues/1275), where the package manager is being
 designed. Expect it to change or be replaced.
 
+## Install
+
+On macOS (Apple Silicon or Intel) and Linux (x86_64 or arm64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bajpainaman/vex/main/install.sh | sh
+```
+
+Or download a build from the [releases](https://github.com/bajpainaman/vex/releases), or build
+from source with `cargo install --git https://github.com/bajpainaman/vex`.
+
 ## A package
 
 ```toml
