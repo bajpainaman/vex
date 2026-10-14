@@ -408,6 +408,12 @@ fn json_describes_each_package_and_search_reads_it() {
         "# numbers\n\nDoubles things.\n",
     )
     .expect("write README.md");
+    fs::create_dir_all(world.path("numbers/tests")).expect("create numbers/tests");
+    fs::write(
+        world.path("numbers/tests/twice_works.vx"),
+        "fn main() -> i32 { return 0; }\n",
+    )
+    .expect("write a test");
     world.publish("numbers");
     world.publish("shapes");
 

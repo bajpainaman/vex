@@ -30,6 +30,9 @@ use crate::version::Version;
 /// longer one, and the archive has all of it.
 const MAX_README_BYTES: usize = 64 * 1024;
 
+/// The directory of a package's test programs, as `vex test` names it.
+const TESTS_DIR: &str = "tests";
+
 /// Where `vex registry json` output goes in a registry, and where `vex search` looks for it.
 pub const PACKAGES_FILE_NAME: &str = "packages.json";
 
@@ -156,7 +159,8 @@ fn read_latest_contents(dir: &Path) -> Result<LatestContents> {
     let files = archive::package_files(dir)?;
     let modules = files
         .iter()
-        .filter(|path| path.extension().is_some_and(|e| e == "vx"))
+        // Test programs are packed so a registry can run them, but nothing imports them.
+        .filter(|path| path.extension().is_some_and(|e| e == "vx") && !path.starts_with(TESTS_DIR))
         .map(|path| {
             path.with_extension("")
                 .components()
