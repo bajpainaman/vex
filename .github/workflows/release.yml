@@ -1,0 +1,96 @@
+name: Release
+
+# Pushing a tag `vX.Y.Z` builds vex for macOS (one binary for Apple Silicon and Intel) and for
+# Linux on x86_64 and arm64, and publishes them as a GitHub release with their SHA-256 sums.
+# The Linux binaries are linked statically against musl, so they run on any distribution.
+# Running it by hand builds and tests everything but publishes nothing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: macos-universal
+            runner: macos-14
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            targets: x86_64-unknown-linux-musl
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            targets: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "error: tag $GITHUB_REF_NAME does not match version $version in Cargo.toml" >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+      - name: Install musl
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo test --locked
+      - name: Build
+        run: |
+          for target in $(echo "${{ matrix.targets }}" | tr ',' ' '); do
+            cargo build --release --locked --target "$target"
+          done
+      - name: Package
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          name="vex-v$version-${{ matrix.name }}"
+          mkdir -p "dist/$name"
+          set -- $(echo "${{ matrix.targets }}" | tr ',' ' ')
+          if [ "$#" -gt 1 ]; then
+            lipo -create -output "dist/$name/vex" $(for t in "$@"; do echo "target/$t/release/vex"; done)
+            lipo -info "dist/$name/vex"
+          else
+            cp "target/$1/release/vex" "dist/$name/vex"
+          fi
+          file "dist/$name/vex"
+          "dist/$name/vex" --version
+          cp README.md LICENSE "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" *.tar.gz SHA256SUMS ../install.sh \
+            --title "vex $GITHUB_REF_NAME" \
+            --notes-file ../.github/release-notes.md
