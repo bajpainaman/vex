@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Prepares a fresh Amp orb to build, lint, and test vex. Safe to rerun on a warm snapshot.
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+step() {
+  local name="$1"
+  shift
+  local start=$SECONDS
+  echo "==> $name"
+  "$@"
+  echo "<== $name ($((SECONDS - start))s)"
+}
+
+install_rust() {
+  # Matches CI: stable with rustfmt and clippy. rustup also puts ~/.cargo/bin on PATH for
+  # login shells.
+  if ! command -v rustup >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/rustup" ]; then
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+      sh -s -- -y --profile minimal --default-toolchain stable --component rustfmt,clippy
+  fi
+  # The installer cannot update this running script's environment.
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+  rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
+  rustup default stable
+}
+
+step "Rust toolchain" install_rust
+step "Fetch crates" cargo fetch --locked
+# Prebuild what CI runs so the first build, clippy, and test in a thread are incremental.
+step "Build tests" cargo test --locked --no-run
+step "Clippy" cargo clippy --locked --all-targets
