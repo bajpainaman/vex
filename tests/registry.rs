@@ -350,3 +350,95 @@ fn run_compiles_a_program_whose_packages_come_from_the_registry() {
     // registry.
     assert!(printed.contains("area 18"), "{printed}");
 }
+
+#[test]
+fn verify_accepts_a_good_registry_and_lists_every_problem_in_a_bad_one() {
+    let world = World::new();
+    world.publish("numbers");
+    world.publish("shapes");
+    let output = world.vex(
+        "app",
+        &["registry", "verify", "--registry", &world.registry()],
+    );
+    assert!(output.status.success(), "{}", printed(&output));
+    assert!(
+        printed(&output).contains("2 published versions checked, no problems"),
+        "{}",
+        printed(&output)
+    );
+
+    // Two separate faults: one archive changed, one index line that disagrees with its package.
+    let archive = world.path("registry/archives/numbers/numbers-1.0.0.tar.gz");
+    let mut bytes = fs::read(&archive).expect("read the archive");
+    bytes.push(0);
+    fs::write(&archive, bytes).expect("change the archive");
+    let index = world.path("registry/index/shapes.jsonl");
+    let text = fs::read_to_string(&index).expect("read the index");
+    fs::write(
+        &index,
+        text.replace(
+            "\"dependencies\":{\"numbers\":\"1.0.0\"}",
+            "\"dependencies\":{}",
+        ),
+    )
+    .expect("change the index");
+
+    let output = world.vex(
+        "app",
+        &["registry", "verify", "--registry", &world.registry()],
+    );
+    assert_fails_with(&output, "2 problem(s) in the registry");
+    assert_fails_with(&output, "numbers 1.0.0: the archive of `numbers` 1.0.0");
+    assert_fails_with(
+        &output,
+        "shapes 1.0.0: the registry package `shapes` 1.0.0 does not match",
+    );
+}
+
+#[test]
+fn json_describes_each_package_and_search_reads_it() {
+    let world = World::new();
+    fs::write(
+        world.path("numbers/vex.toml"),
+        "[package]\nname = \"numbers\"\nversion = \"1.0.0\"\ndescription = \"Small helpers for integers\"\n",
+    )
+    .expect("write vex.toml");
+    fs::write(
+        world.path("numbers/README.md"),
+        "# numbers\n\nDoubles things.\n",
+    )
+    .expect("write README.md");
+    world.publish("numbers");
+    world.publish("shapes");
+
+    let output = world.vex(
+        "app",
+        &["registry", "json", "--registry", &world.registry()],
+    );
+    assert!(output.status.success(), "{}", printed(&output));
+    let json: serde_json::Value = serde_json::from_slice(
+        &fs::read(world.path("registry/packages.json")).expect("packages.json was written"),
+    )
+    .expect("packages.json is JSON");
+    let numbers = &json["packages"][0];
+    assert_eq!(numbers["name"], "numbers");
+    assert_eq!(numbers["latest"], "1.0.0");
+    assert_eq!(numbers["description"], "Small helpers for integers");
+    assert_eq!(numbers["readme"], "# numbers\n\nDoubles things.\n");
+    assert_eq!(numbers["modules"], serde_json::json!(["twice"]));
+    assert_eq!(numbers["used_by"], serde_json::json!(["shapes"]));
+    assert_eq!(
+        json["packages"][1]["versions"][0]["dependencies"]["numbers"],
+        "1.0.0"
+    );
+
+    let output = world.vex(
+        "app",
+        &["search", "INTEGERS", "--registry", &world.registry()],
+    );
+    assert!(output.status.success(), "{}", printed(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "numbers 1.0.0  Small helpers for integers\n"
+    );
+}

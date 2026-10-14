@@ -214,6 +214,33 @@ impl Registry {
         Ok(())
     }
 
+    /// The name of every package in a registry in a directory, sorted.
+    ///
+    /// # Errors
+    ///
+    /// If the registry is on the web, which cannot list its files, or the index cannot be read.
+    pub fn package_names(&self) -> Result<Vec<String>> {
+        let Location::Directory(root) = &self.location else {
+            bail!("vex can list the packages only of a registry in a directory");
+        };
+        let index_dir = root.join(INDEX_DIR);
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&index_dir)
+            .with_context(|| format!("cannot list `{}`", index_dir.display()))?
+        {
+            let path = entry
+                .with_context(|| format!("cannot list `{}`", index_dir.display()))?
+                .path();
+            if path.extension().is_some_and(|e| e == INDEX_FILE_EXTENSION) {
+                if let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     /// The registry as a person would write it.
     pub fn describe(&self) -> String {
         match &self.location {
@@ -227,7 +254,7 @@ impl Registry {
     /// # Errors
     ///
     /// If the file exists but cannot be read.
-    fn read(&self, relative: &str) -> Result<Option<Vec<u8>>> {
+    pub fn read(&self, relative: &str) -> Result<Option<Vec<u8>>> {
         match &self.location {
             Location::Directory(root) => {
                 let path = root.join(relative);

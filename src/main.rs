@@ -20,6 +20,7 @@ mod lock;
 mod manifest;
 mod new_package;
 mod registry;
+mod registry_tools;
 mod resolve;
 mod test_runner;
 mod version;
@@ -101,6 +102,13 @@ enum CliCommand {
     Package,
     /// Put this version of the package into a registry in a directory
     Publish,
+    /// List the registry packages whose name or description contains TEXT
+    Search { text: String },
+    /// Tools for the people who run a registry
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    },
     /// Create a new package in a new directory
     New {
         /// The directory to create. Its name is the package's name
@@ -109,6 +117,18 @@ enum CliCommand {
         /// Make a library, with no `main.vx`
         #[arg(long = "lib")]
         lib: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RegistryCommand {
+    /// Check every published version: archives, index lines and dependencies
+    Verify,
+    /// Write packages.json, which the registry's web pages and `vex search` read
+    Json {
+        /// Where to write it. Without it, packages.json at the top of the registry
+        #[arg(long = "output", short = 'o', value_name = "FILE")]
+        output: Option<PathBuf>,
     },
 }
 
@@ -151,9 +171,24 @@ fn main() {
 ///
 /// If the package or one of its dependencies is not usable, or the compiler cannot be run.
 fn run(cli: Cli) -> Result<i32> {
-    if let CliCommand::New { path, lib } = &cli.command {
-        new_package::create(path, *lib)?;
-        return Ok(0);
+    match &cli.command {
+        CliCommand::New { path, lib } => {
+            new_package::create(path, *lib)?;
+            return Ok(0);
+        }
+        CliCommand::Search { text } => {
+            let registry = open_registry(cli.registry.as_deref())?.with_context(|| {
+                format!("vex search needs a registry. Pass --registry, or set {REGISTRY_ENV_VAR}")
+            })?;
+            for line in registry_tools::search(&registry, text)? {
+                println!("{line}");
+            }
+            return Ok(0);
+        }
+        CliCommand::Registry { command } => {
+            return registry_command(command, cli.registry.as_deref());
+        }
+        _ => {}
     }
     let manifest_path = match cli.manifest_path {
         Some(path) => path,
@@ -196,7 +231,9 @@ fn run(cli: Cli) -> Result<i32> {
                 &compiler_path,
             );
         }
-        CliCommand::New { .. } => unreachable!("`vex new` returned above"),
+        CliCommand::New { .. } | CliCommand::Search { .. } | CliCommand::Registry { .. } => {
+            unreachable!("handled before vex.toml is read")
+        }
         CliCommand::Fetch => {
             let graph = resolve_and_lock(manifest, registry.as_mut(), lock_mode)?;
             for release in graph.releases.values() {
@@ -283,6 +320,33 @@ fn build_or_run(
         Some(code) => Ok(code),
         None => bail!("`{}` was stopped by a signal: {status}", program.display()),
     }
+}
+
+/// # Errors
+///
+/// If there is no registry, or the command fails.
+fn registry_command(command: &RegistryCommand, flag: Option<&str>) -> Result<i32> {
+    let place = match flag {
+        Some(place) => place.to_string(),
+        None => env::var(REGISTRY_ENV_VAR).with_context(|| {
+            format!("vex registry needs a registry. Pass --registry DIR, or set {REGISTRY_ENV_VAR}")
+        })?,
+    };
+    let mut registry = Registry::open(&place)?;
+    match command {
+        RegistryCommand::Verify => {
+            let checked = registry_tools::verify(&mut registry)?;
+            println!("{checked} published versions checked, no problems");
+        }
+        RegistryCommand::Json { output } => {
+            let output = output
+                .clone()
+                .unwrap_or_else(|| Path::new(&place).join(registry_tools::PACKAGES_FILE_NAME));
+            let count = registry_tools::write_json(&mut registry, &output)?;
+            println!("wrote {count} packages to {}", output.display());
+        }
+    }
+    Ok(0)
 }
 
 /// The registry from `--registry`, else from `$VEX_REGISTRY`, else none.
