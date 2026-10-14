@@ -120,7 +120,7 @@ fn registry_requirements(root: &Manifest) -> Result<Vec<Requirement>> {
 /// # Errors
 ///
 /// If the two disagree, or the `vex.toml` cannot be read.
-fn check_matches_index(dir: &std::path::Path, release: &Release) -> Result<()> {
+pub fn check_matches_index(dir: &std::path::Path, release: &Release) -> Result<()> {
     let manifest = Manifest::load(&dir.join(MANIFEST_FILE_NAME)).with_context(|| {
         format!(
             "in the registry package `{}` {}",

@@ -63,6 +63,14 @@ vex add numbers@1.2.0     # add a given version
 vex fetch                 # download what the build needs and write vex.lock
 vex package               # write the archive `publish` would publish, to target/package
 vex publish               # put this version into the registry
+vex search integers       # find packages by name or description
+```
+
+For the people who run a registry:
+
+```sh
+vex registry verify       # check every published version, as the registry's CI does
+vex registry json         # write packages.json, which the web pages and `vex search` read
 ```
 
 Every command takes `--registry DIR|URL` (or `$VEX_REGISTRY`) and `--locked`, which fails
