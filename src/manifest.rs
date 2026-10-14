@@ -36,10 +36,21 @@ pub struct Manifest {
     pub dir: PathBuf,
     /// The file with `fn main`. A package without one is a library.
     pub main: Option<PathBuf>,
-    /// A sentence about the package, shown by `vex search`.
+    /// A sentence about the package, which goes into the registry.
     pub description: Option<String>,
     /// Each package this one depends on, by package name.
     pub dependencies: BTreeMap<String, Dependency>,
+    /// The C libraries the package calls through `extern` blocks, from `[link]`.
+    pub link: Link,
+}
+
+/// `[link]`: C libraries a package calls, which `vxc` links with `-l` and finds with `-L`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Link {
+    /// `libraries = ["z"]` links `libz`.
+    pub libraries: Vec<String>,
+    /// `dirs = ["native"]`: where to look for them, besides the system's usual places. Absolute.
+    pub dirs: Vec<PathBuf>,
 }
 
 /// Where a dependency comes from.
@@ -58,6 +69,17 @@ struct RawManifest {
     package: RawPackage,
     #[serde(default)]
     dependencies: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    link: RawLink,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLink {
+    #[serde(default)]
+    libraries: Vec<String>,
+    #[serde(default)]
+    dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,6 +143,20 @@ impl Manifest {
             dependencies.insert(name.clone(), dependency(name, value, dir)?);
         }
 
+        for library in &raw.link.libraries {
+            check_library_name(library)?;
+        }
+        let mut link_dirs = Vec::new();
+        for link_dir in &raw.link.dirs {
+            let path = dir.join(link_dir);
+            link_dirs.push(path.canonicalize().with_context(|| {
+                format!(
+                    "`dirs` under `[link]` names `{}`, which does not exist",
+                    link_dir.display()
+                )
+            })?);
+        }
+
         Ok(Self {
             name: raw.package.name,
             version,
@@ -128,6 +164,10 @@ impl Manifest {
             main,
             description: raw.package.description,
             dependencies,
+            link: Link {
+                libraries: raw.link.libraries,
+                dirs: link_dirs,
+            },
         })
     }
 }
@@ -149,6 +189,23 @@ pub fn check_package_name(name: &str) -> Result<()> {
     }
     if RESERVED_PACKAGE_NAMES.contains(&name) {
         bail!("`{name}` is part of the standard library and cannot be a package name");
+    }
+    Ok(())
+}
+
+/// A library name goes to `vxc -l NAME`. Only the characters library names use are allowed, so
+/// a name can never be read as another flag.
+///
+/// # Errors
+///
+/// If `name` is empty, starts with `-`, or has another character.
+fn check_library_name(name: &str) -> Result<()> {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '+');
+    if name.is_empty() || name.starts_with('-') || !name.chars().all(allowed) {
+        bail!(
+            "`{name}` under `[link]` is not a library name: write the name without `lib` and \
+             without `-l`, like `z` for zlib"
+        );
     }
     Ok(())
 }
@@ -361,6 +418,46 @@ mod tests {
         );
         assert!(
             error.contains("must be written `geometry = \"1.2.0\"` or"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn link_names_libraries_and_their_directories() {
+        let dir = tempfile::tempdir().expect("create a temporary directory");
+        fs::create_dir_all(dir.path().join("native")).expect("create native");
+        let manifest = Manifest::parse(
+            "[package]\nname = \"zip\"\nversion = \"1.0.0\"\n\n[link]\nlibraries = [\"z\", \"stdc++\"]\ndirs = [\"native\"]\n",
+            dir.path(),
+        )
+        .expect("a vex.toml with [link]");
+        assert_eq!(manifest.link.libraries, ["z", "stdc++"]);
+        assert_eq!(
+            manifest.link.dirs,
+            [dir.path()
+                .join("native")
+                .canonicalize()
+                .expect("resolve native")]
+        );
+    }
+
+    #[test]
+    fn a_library_name_cannot_be_a_flag() {
+        for name in ["-lz", "", "z y", "../z", "z;rm"] {
+            let error = error_of(&format!(
+                "[package]\nname = \"zip\"\nversion = \"1.0.0\"\n\n[link]\nlibraries = [\"{name}\"]\n"
+            ));
+            assert!(error.contains("is not a library name"), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_link_directory_must_exist() {
+        let error = error_of(
+            "[package]\nname = \"zip\"\nversion = \"1.0.0\"\n\n[link]\ndirs = [\"native\"]\n",
+        );
+        assert!(
+            error.contains("names `native`, which does not exist"),
             "{error}"
         );
     }

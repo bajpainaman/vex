@@ -12,8 +12,9 @@
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Context, Result};
 
 use crate::graph::PackageGraph;
 
@@ -31,7 +32,9 @@ const PACKAGE_DIR_NAME: &str = "package";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     /// Compile the package to an object file.
-    Build,
+    BuildObject,
+    /// Compile the package to a program that runs by itself.
+    BuildExecutable,
     /// Compile the package and run it.
     Run,
 }
@@ -43,6 +46,46 @@ pub struct CompileOptions {
     pub host: Option<String>,
     /// Arguments for the program itself. Only used by `Action::Run`.
     pub program_args: Vec<String>,
+    /// The file to compile instead of the package's main file, such as a test.
+    pub entry: Option<PathBuf>,
+    /// Where to write a program or object file instead of `target/<name>`.
+    pub output: Option<PathBuf>,
+}
+
+/// How one run of the compiler went.
+#[derive(Debug)]
+pub enum Compiled {
+    Ok,
+    /// The compiler refused the program. `printed` is everything it wrote, for the user.
+    Failed {
+        exit_code: i32,
+        printed: String,
+    },
+}
+
+/// What the `vxc` in use can do. Released compilers and ones built from `main` differ, so `vex`
+/// asks rather than assumes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompilerFeatures {
+    /// `-a emit-exe` builds a program that runs by itself.
+    pub executables: bool,
+    /// `-l` and `-L` link C libraries.
+    pub c_libraries: bool,
+}
+
+impl CompilerFeatures {
+    /// Read the features from `vxc --help`. A compiler that cannot be run has none; running it
+    /// for the build reports why.
+    pub fn of(compiler: &Path) -> Self {
+        let Ok(output) = Command::new(compiler).arg("--help").output() else {
+            return Self::default();
+        };
+        let help = String::from_utf8_lossy(&output.stdout);
+        Self {
+            executables: help.contains("emit-exe"),
+            c_libraries: help.contains("--library-dir"),
+        }
+    }
 }
 
 /// `$VXC`, else the `vxc` installed beside this program, else whichever `vxc` is on `PATH`.
@@ -57,9 +100,47 @@ pub fn locate_compiler() -> PathBuf {
     beside_this_program.unwrap_or_else(|| PathBuf::from(COMPILER_NAME))
 }
 
-/// The object file `vex build` writes for this package.
-pub fn output_path(graph: &PackageGraph) -> PathBuf {
-    output_dir(graph).join(format!("{}.o", graph.root.name))
+/// The file `vex build` writes for this package: `target/<name>`, or `target/<name>.o` for an
+/// object file.
+pub fn output_path(graph: &PackageGraph, action: Action) -> PathBuf {
+    let name = match action {
+        Action::BuildObject => format!("{}.o", graph.root.name),
+        Action::BuildExecutable | Action::Run => graph.root.name.clone(),
+    };
+    output_dir(graph).join(name)
+}
+
+/// Run `compiler` with `args`, keeping its progress lines off the screen: they are shown only if
+/// it fails. What it writes to stderr, such as warnings, is always shown.
+///
+/// # Errors
+///
+/// If the compiler cannot be started or is stopped by a signal.
+pub fn compile(compiler: &Path, args: &[OsString]) -> Result<Compiled> {
+    let output = Command::new(compiler)
+        .args(args)
+        .output()
+        .with_context(|| {
+            format!(
+                "cannot run the compiler `{}`. Install Vx, or set VXC to the path of `vxc`",
+                compiler.display()
+            )
+        })?;
+    let Some(exit_code) = output.status.code() else {
+        bail!("the compiler was stopped by a signal: {}", output.status);
+    };
+    if exit_code == 0 {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        return Ok(Compiled::Ok);
+    }
+    Ok(Compiled::Failed {
+        exit_code,
+        printed: format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    })
 }
 
 /// The directory `vex package` writes archives into.
@@ -76,13 +157,14 @@ pub fn output_dir(graph: &PackageGraph) -> PathBuf {
 ///
 /// # Errors
 ///
-/// If the root package has no main file.
+/// If the root package has no main file, or it links C libraries and the compiler cannot.
 pub fn compiler_args(
     graph: &PackageGraph,
     action: Action,
     options: &CompileOptions,
+    features: CompilerFeatures,
 ) -> Result<Vec<OsString>> {
-    let Some(main) = &graph.root.main else {
+    let Some(main) = options.entry.as_ref().or(graph.root.main.as_ref()) else {
         bail!(
             "package `{}` has no `main.vx`, so there is nothing to build or run. Add one, or name \
              the file with `main = \"..\"` under `[package]`",
@@ -107,12 +189,50 @@ pub fn compiler_args(
         args.push("--host".into());
         args.push(host.into());
     }
+    // An object file is not linked, so its C libraries are for whoever links it.
+    let links = action != Action::BuildObject
+        && !(graph.link.libraries.is_empty() && graph.link.dirs.is_empty());
+    if links {
+        ensure!(
+            features.c_libraries,
+            "the build links the C libraries {}, but this vxc has no `-l` flag to link them. Use \
+             a vxc built from Vx's `main`",
+            graph.link.libraries.join(", ")
+        );
+        for library in &graph.link.libraries {
+            args.push("-l".into());
+            args.push(library.into());
+        }
+        for dir in &graph.link.dirs {
+            args.push("-L".into());
+            args.push(dir.into());
+        }
+    }
     match action {
-        Action::Build => {
+        Action::BuildObject => {
             args.push("-c".into());
             args.push(main.into());
             args.push("-o".into());
-            args.push(output_path(graph).into());
+            args.push(
+                options
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| output_path(graph, action))
+                    .into(),
+            );
+        }
+        Action::BuildExecutable => {
+            args.push("-a".into());
+            args.push("emit-exe".into());
+            args.push(main.into());
+            args.push("-o".into());
+            args.push(
+                options
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| output_path(graph, action))
+                    .into(),
+            );
         }
         Action::Run => {
             args.push("--run".into());
@@ -134,7 +254,7 @@ pub fn compiler_args(
 )]
 mod tests {
     use super::*;
-    use crate::manifest::{Dependency, Manifest};
+    use crate::manifest::{Dependency, Link, Manifest};
     use crate::version::Version;
     use std::collections::BTreeMap;
 
@@ -153,6 +273,7 @@ mod tests {
                 "shapes".to_string(),
                 Dependency::Path(PathBuf::from("/work/shapes")),
             )]),
+            link: Link::default(),
         };
         let packages = BTreeMap::from([
             ("app".to_string(), PathBuf::from("/work/app")),
@@ -162,11 +283,17 @@ mod tests {
             root,
             packages,
             releases: BTreeMap::new(),
+            link: Link::default(),
         }
     }
 
+    const EVERY_FEATURE: CompilerFeatures = CompilerFeatures {
+        executables: true,
+        c_libraries: true,
+    };
+
     fn args_as_text(graph: &PackageGraph, action: Action, options: &CompileOptions) -> Vec<String> {
-        compiler_args(graph, action, options)
+        compiler_args(graph, action, options, EVERY_FEATURE)
             .expect("a package with a main file")
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -192,7 +319,7 @@ mod tests {
     #[test]
     fn build_writes_an_object_file_named_after_the_package() {
         let graph = graph_of_app_and_shapes(Some("/work/app/main.vx"));
-        let args = args_as_text(&graph, Action::Build, &CompileOptions::default());
+        let args = args_as_text(&graph, Action::BuildObject, &CompileOptions::default());
         assert_eq!(
             args[4..],
             ["-c", "/work/app/main.vx", "-o", "/work/app/target/app.o"]
@@ -206,6 +333,8 @@ mod tests {
             machine: Some(PathBuf::from("fleet/h100-sxm.vx")),
             host: Some("default".to_string()),
             program_args: vec!["--steps".to_string(), "3".to_string()],
+            entry: None,
+            output: None,
         };
         let args = args_as_text(&graph, Action::Run, &options);
         assert_eq!(
@@ -227,8 +356,83 @@ mod tests {
     #[test]
     fn a_library_cannot_be_built_or_run() {
         let graph = graph_of_app_and_shapes(None);
-        let error = compiler_args(&graph, Action::Run, &CompileOptions::default())
-            .expect_err("a package with no main file");
+        let error = compiler_args(
+            &graph,
+            Action::Run,
+            &CompileOptions::default(),
+            EVERY_FEATURE,
+        )
+        .expect_err("a package with no main file");
         assert!(error.to_string().contains("has no `main.vx`"), "{error}");
+    }
+
+    #[test]
+    fn build_can_write_an_executable() {
+        let graph = graph_of_app_and_shapes(Some("/work/app/main.vx"));
+        let args = args_as_text(&graph, Action::BuildExecutable, &CompileOptions::default());
+        assert_eq!(
+            args[4..],
+            [
+                "-a",
+                "emit-exe",
+                "/work/app/main.vx",
+                "-o",
+                "/work/app/target/app"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_entry_file_replaces_the_main_file() {
+        let graph = graph_of_app_and_shapes(None);
+        let options = CompileOptions {
+            entry: Some(PathBuf::from("/work/app/tests/sum.vx")),
+            ..CompileOptions::default()
+        };
+        let args = args_as_text(&graph, Action::Run, &options);
+        assert_eq!(args[4..], ["--run", "/work/app/tests/sum.vx"]);
+    }
+
+    fn graph_that_links_zlib() -> PackageGraph {
+        let mut graph = graph_of_app_and_shapes(Some("/work/app/main.vx"));
+        graph.link = Link {
+            libraries: vec!["z".to_string()],
+            dirs: vec![PathBuf::from("/work/shapes/native")],
+        };
+        graph
+    }
+
+    #[test]
+    fn c_libraries_are_linked_into_a_program_but_not_an_object_file() {
+        let graph = graph_that_links_zlib();
+        let run = args_as_text(&graph, Action::Run, &CompileOptions::default());
+        assert_eq!(
+            run[4..],
+            [
+                "-l",
+                "z",
+                "-L",
+                "/work/shapes/native",
+                "--run",
+                "/work/app/main.vx"
+            ]
+        );
+        let object = args_as_text(&graph, Action::BuildObject, &CompileOptions::default());
+        assert!(!object.contains(&"-l".to_string()), "{object:?}");
+    }
+
+    #[test]
+    fn c_libraries_need_a_compiler_that_links_them() {
+        let error = compiler_args(
+            &graph_that_links_zlib(),
+            Action::Run,
+            &CompileOptions::default(),
+            CompilerFeatures::default(),
+        )
+        .expect_err("a vxc without -l");
+        assert!(
+            error.to_string().contains("this vxc has no `-l` flag"),
+            "{error}"
+        );
     }
 }

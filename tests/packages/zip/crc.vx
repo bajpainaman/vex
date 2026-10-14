@@ -1,0 +1,16 @@
+//===- crc.vx - Vx Package Tool ---------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A library package that wraps zlib, a C library. Its vex.toml names `z` under `[link]`.
+
+extern {
+    fn crc32(crc : u64, buf : *const i8, len : u32) -> u64;
+}
+
+fn crc_of_digits() -> u64 {
+    return unsafe { crc32(0u64, "123456789", 9u32) };
+}

@@ -1,0 +1,17 @@
+//===- main.vx - Vx Package Tool --------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A program that uses `zip`, so it needs zlib linked without naming it itself.
+
+import zip::crc;
+
+fn main() -> i32 {
+  print(crc_of_digits());
+  print!("
+");
+  return 0;
+}

@@ -143,6 +143,19 @@ fn a_package_with_a_path_dependency_cannot_be_published() {
 }
 
 #[test]
+fn a_package_that_names_link_directories_cannot_be_published() {
+    let world = World::new();
+    fs::create_dir_all(world.path("numbers/native")).expect("create native");
+    fs::write(
+        world.path("numbers/vex.toml"),
+        "[package]\nname = \"numbers\"\nversion = \"1.0.0\"\n\n[link]\nlibraries = [\"z\"]\ndirs = [\"native\"]\n",
+    )
+    .expect("write vex.toml");
+    let output = world.vex("numbers", &["publish", "--registry", &world.registry()]);
+    assert_fails_with(&output, "`numbers` names `dirs` under `[link]`");
+}
+
+#[test]
 fn a_published_version_cannot_be_published_again() {
     let world = World::new();
     world.publish("numbers");

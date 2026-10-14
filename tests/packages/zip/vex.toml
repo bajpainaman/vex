@@ -1,0 +1,6 @@
+[package]
+name = "zip"
+version = "1.0.0"
+
+[link]
+libraries = ["z"]
